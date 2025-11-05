@@ -32,7 +32,7 @@ func getEtcd() discovery.SvcDiscoveryRegistry {
 func TestGetConn(t *testing.T) {
 	r := getEtcd()
 	for i := 1; ; i++ {
-		cs, err := r.GetConn(context.Background(), testServerName)
+		cs, err := r.GetConns(context.Background(), testServerName)
 		if err == nil {
 			t.Log("get conns success:", i, cs)
 		} else {
@@ -66,9 +66,36 @@ func TestRegister(t *testing.T) {
 func TestWatch(t *testing.T) {
 	r := getEtcd()
 	t.Log("start watch")
-	err := r.WatchKey(context.Background(), "openim/test-user", func(data *discovery.WatchKey) error {
-		t.Log("watch data:", string(data.Value))
-		return nil
-	})
-	t.Log(err)
+	for i := 0; i < 5; i++ {
+		index := i + 1
+		go func() {
+			err := r.WatchKey(context.Background(), "test-user", func(data *discovery.WatchKey) error {
+				t.Log(index, "watch data:", string(data.Key), string(data.Value), data.Type)
+				return nil
+			})
+			t.Log(err)
+		}()
+	}
+
+	for i := 1; ; i++ {
+		cs, err := r.GetConns(context.Background(), testServerName)
+		if err == nil {
+			t.Log("get conns success:", i, cs)
+		} else {
+			t.Log("get conns failed:", i, err)
+		}
+		time.Sleep(time.Second)
+	}
+
+	select {}
+}
+
+func TestGetValue(t *testing.T) {
+	r := getEtcd()
+	t.Log("start watch")
+	val, err := r.GetKeyWithPrefix(context.Background(), "openim/test-user")
+	if err != nil {
+		panic(err)
+	}
+	t.Log(val)
 }

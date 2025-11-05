@@ -14,6 +14,7 @@ import (
 	"github.com/openimsdk/tools/discovery"
 	"github.com/openimsdk/tools/errs"
 	"github.com/openimsdk/tools/log"
+	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/naming/endpoints"
 	"go.etcd.io/etcd/client/v3/naming/resolver"
@@ -28,7 +29,6 @@ const (
 	defaultLeaseTTL           = 30 * time.Second
 	defaultRequestTimeout     = 5 * time.Second
 	defaultInitialResolveWait = 3 * time.Second
-	resolveRetryInterval      = 200 * time.Millisecond
 	keepAliveInitialBackoff   = time.Second
 	keepAliveMaxBackoff       = 30 * time.Second
 )
@@ -91,6 +91,406 @@ func (r *registration) stopChan() <-chan struct{} {
 	return r.stopCh
 }
 
+type serviceEntry struct {
+	mu        sync.RWMutex
+	addresses map[string]struct{}
+
+	ready     chan struct{}
+	readyOnce sync.Once
+
+	updateCh chan struct{}
+
+	initOnce sync.Once
+
+	cancelMu sync.Mutex
+	cancel   context.CancelFunc
+}
+
+func newServiceEntry() *serviceEntry {
+	return &serviceEntry{
+		addresses: make(map[string]struct{}),
+		ready:     make(chan struct{}),
+		updateCh:  make(chan struct{}),
+	}
+}
+
+func (e *serviceEntry) markReady() {
+	e.readyOnce.Do(func() {
+		close(e.ready)
+	})
+}
+
+func (e *serviceEntry) waitReady(ctx context.Context) error {
+	select {
+	case <-e.ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *serviceEntry) setAddresses(addrs []string) {
+	m := make(map[string]struct{}, len(addrs))
+	for _, addr := range addrs {
+		m[addr] = struct{}{}
+	}
+	e.mu.Lock()
+	e.addresses = m
+	e.mu.Unlock()
+	e.notify()
+}
+
+func (e *serviceEntry) addAddress(addr string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.addresses == nil {
+		e.addresses = make(map[string]struct{})
+	}
+	if _, ok := e.addresses[addr]; ok {
+		return false
+	}
+	e.addresses[addr] = struct{}{}
+	return true
+}
+
+func (e *serviceEntry) removeAddress(addr string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.addresses == nil {
+		return false
+	}
+	if _, ok := e.addresses[addr]; !ok {
+		return false
+	}
+	delete(e.addresses, addr)
+	return true
+}
+
+func (e *serviceEntry) addressesList() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	result := make([]string, 0, len(e.addresses))
+	for addr := range e.addresses {
+		result = append(result, addr)
+	}
+	return result
+}
+
+func (e *serviceEntry) notify() {
+	e.mu.Lock()
+	old := e.updateCh
+	e.updateCh = make(chan struct{})
+	e.mu.Unlock()
+	close(old)
+}
+
+func (e *serviceEntry) subscribe() <-chan struct{} {
+	e.mu.RLock()
+	ch := e.updateCh
+	e.mu.RUnlock()
+	return ch
+}
+
+func (e *serviceEntry) setCancel(cancel context.CancelFunc) {
+	e.cancelMu.Lock()
+	e.cancel = cancel
+	e.cancelMu.Unlock()
+}
+
+func (e *serviceEntry) stop() {
+	e.cancelMu.Lock()
+	cancel := e.cancel
+	e.cancel = nil
+	e.cancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	e.notify()
+}
+
+type keyEntry struct {
+	mu     sync.RWMutex
+	value  []byte
+	exists bool
+
+	ready     chan struct{}
+	readyOnce sync.Once
+	initOnce  sync.Once
+
+	updateCh chan struct{}
+
+	cancelMu sync.Mutex
+	cancel   context.CancelFunc
+
+	watchersMu sync.Mutex
+	watchers   map[chan *discovery.WatchKey]struct{}
+}
+
+func newKeyEntry() *keyEntry {
+	return &keyEntry{
+		ready:    make(chan struct{}),
+		updateCh: make(chan struct{}),
+		watchers: make(map[chan *discovery.WatchKey]struct{}),
+	}
+}
+
+func (e *keyEntry) markReady() {
+	e.readyOnce.Do(func() {
+		close(e.ready)
+	})
+}
+
+func (e *keyEntry) waitReady(ctx context.Context) error {
+	select {
+	case <-e.ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *keyEntry) setValue(val []byte, exists bool) {
+	e.mu.Lock()
+	if exists && val != nil {
+		e.value = cloneBytes(val)
+	} else {
+		e.value = nil
+	}
+	e.exists = exists
+	e.mu.Unlock()
+	e.notify()
+	e.broadcast(val, exists)
+}
+
+func (e *keyEntry) getValue() ([]byte, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if !e.exists {
+		return nil, false
+	}
+	return cloneBytes(e.value), true
+}
+
+func (e *keyEntry) notify() {
+	e.mu.Lock()
+	old := e.updateCh
+	e.updateCh = make(chan struct{})
+	e.mu.Unlock()
+	close(old)
+}
+
+func (e *keyEntry) subscribeUpdates() <-chan struct{} {
+	e.mu.RLock()
+	ch := e.updateCh
+	e.mu.RUnlock()
+	return ch
+}
+
+func (e *keyEntry) subscribeWatcher() (<-chan *discovery.WatchKey, func()) {
+	ch := make(chan *discovery.WatchKey, 1)
+	e.watchersMu.Lock()
+	e.watchers[ch] = struct{}{}
+	e.watchersMu.Unlock()
+	return ch, func() {
+		e.watchersMu.Lock()
+		if _, ok := e.watchers[ch]; ok {
+			delete(e.watchers, ch)
+			close(ch)
+		}
+		e.watchersMu.Unlock()
+	}
+}
+
+func (e *keyEntry) broadcast(val []byte, exists bool) {
+	e.watchersMu.Lock()
+	defer e.watchersMu.Unlock()
+	if len(e.watchers) == 0 {
+		return
+	}
+	for ch := range e.watchers {
+		var payload *discovery.WatchKey
+		if exists && val != nil {
+			payload = &discovery.WatchKey{Value: cloneBytes(val)}
+		} else {
+			payload = &discovery.WatchKey{Value: nil}
+		}
+		select {
+		case ch <- payload:
+		default:
+		}
+	}
+}
+
+func (e *keyEntry) setCancel(cancel context.CancelFunc) {
+	e.cancelMu.Lock()
+	e.cancel = cancel
+	e.cancelMu.Unlock()
+}
+
+func (e *keyEntry) stop() {
+	e.cancelMu.Lock()
+	cancel := e.cancel
+	e.cancel = nil
+	e.cancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	e.notify()
+	e.watchersMu.Lock()
+	for ch := range e.watchers {
+		close(ch)
+	}
+	e.watchers = make(map[chan *discovery.WatchKey]struct{})
+	e.watchersMu.Unlock()
+}
+
+type prefixEntry struct {
+	mu     sync.RWMutex
+	values map[string][]byte
+
+	ready     chan struct{}
+	readyOnce sync.Once
+	initOnce  sync.Once
+
+	cancelMu sync.Mutex
+	cancel   context.CancelFunc
+
+	watchersMu sync.Mutex
+	watchers   map[chan *discovery.WatchKey]struct{}
+}
+
+func newPrefixEntry() *prefixEntry {
+	return &prefixEntry{
+		values:   make(map[string][]byte),
+		ready:    make(chan struct{}),
+		watchers: make(map[chan *discovery.WatchKey]struct{}),
+	}
+}
+
+func (e *prefixEntry) markReady() {
+	e.readyOnce.Do(func() {
+		close(e.ready)
+	})
+}
+
+func (e *prefixEntry) waitReady(ctx context.Context) error {
+	select {
+	case <-e.ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *prefixEntry) setValues(values map[string][]byte) {
+	e.mu.Lock()
+	e.values = make(map[string][]byte, len(values))
+	for k, v := range values {
+		e.values[k] = cloneBytes(v)
+	}
+	e.mu.Unlock()
+}
+
+func (e *prefixEntry) upsert(key string, val []byte) {
+	e.mu.Lock()
+	if e.values == nil {
+		e.values = make(map[string][]byte)
+	}
+	e.values[key] = cloneBytes(val)
+	e.mu.Unlock()
+}
+
+func (e *prefixEntry) remove(key string) {
+	e.mu.Lock()
+	if e.values != nil {
+		delete(e.values, key)
+	}
+	e.mu.Unlock()
+}
+
+func (e *prefixEntry) valuesList() [][]byte {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if len(e.values) == 0 {
+		return nil
+	}
+	result := make([][]byte, 0, len(e.values))
+	for _, v := range e.values {
+		result = append(result, cloneBytes(v))
+	}
+	return result
+}
+
+func (e *prefixEntry) snapshot() map[string][]byte {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if len(e.values) == 0 {
+		return nil
+	}
+	result := make(map[string][]byte, len(e.values))
+	for k, v := range e.values {
+		result[k] = cloneBytes(v)
+	}
+	return result
+}
+
+func (e *prefixEntry) setCancel(cancel context.CancelFunc) {
+	e.cancelMu.Lock()
+	e.cancel = cancel
+	e.cancelMu.Unlock()
+}
+
+func (e *prefixEntry) stop() {
+	e.cancelMu.Lock()
+	cancel := e.cancel
+	e.cancel = nil
+	e.cancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	e.watchersMu.Lock()
+	for ch := range e.watchers {
+		close(ch)
+	}
+	e.watchers = make(map[chan *discovery.WatchKey]struct{})
+	e.watchersMu.Unlock()
+}
+
+func (e *prefixEntry) subscribeWatcher() (<-chan *discovery.WatchKey, func()) {
+	ch := make(chan *discovery.WatchKey, 1)
+	e.watchersMu.Lock()
+	e.watchers[ch] = struct{}{}
+	e.watchersMu.Unlock()
+	return ch, func() {
+		e.watchersMu.Lock()
+		if _, ok := e.watchers[ch]; ok {
+			delete(e.watchers, ch)
+			close(ch)
+		}
+		e.watchersMu.Unlock()
+	}
+}
+
+func (e *prefixEntry) broadcast(key string, val []byte, t discovery.WatchType) {
+	e.watchersMu.Lock()
+	defer e.watchersMu.Unlock()
+	if len(e.watchers) == 0 {
+		return
+	}
+	var payload *discovery.WatchKey
+	if t == discovery.WatchTypeDelete {
+		payload = &discovery.WatchKey{Key: []byte(key), Value: nil, Type: t}
+	} else {
+		payload = &discovery.WatchKey{Key: []byte(key), Value: cloneBytes(val), Type: t}
+	}
+	for ch := range e.watchers {
+		select {
+		case ch <- payload:
+		default:
+		}
+	}
+}
+
 // SvcDiscoveryRegistryImpl 实现服务注册与发现
 type SvcDiscoveryRegistryImpl struct {
 	client   *clientv3.Client
@@ -107,12 +507,14 @@ type SvcDiscoveryRegistryImpl struct {
 	rrIndex       map[string]int
 	registrations map[string]*registration
 
+	serviceEntries map[string]*serviceEntry
+	keyEntries     map[string]*keyEntry
+	prefixEntries  map[string]*prefixEntry
+
 	serviceKey        string
 	endpointMgr       endpoints.Manager
 	leaseID           clientv3.LeaseID
 	rpcRegisterTarget string
-
-	watchCancels []context.CancelFunc
 }
 
 // NewSvcDiscoveryRegistry creates a new service discovery registry implementation.
@@ -162,18 +564,18 @@ func NewSvcDiscoveryRegistry(rootDirectory string, endpointsList []string, watch
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithResolvers(r),
 		},
-		connCache:     make(map[string]map[string]*grpc.ClientConn),
-		rrIndex:       make(map[string]int),
-		registrations: make(map[string]*registration),
+		connCache:      make(map[string]map[string]*grpc.ClientConn),
+		rrIndex:        make(map[string]int),
+		registrations:  make(map[string]*registration),
+		serviceEntries: make(map[string]*serviceEntry),
+		keyEntries:     make(map[string]*keyEntry),
+		prefixEntries:  make(map[string]*prefixEntry),
 	}
 
-	s.watchServiceChanges()
-	if len(s.watchNames) > 0 {
-		go func() {
-			if err := s.initializeConnMap(); err != nil && !errors.Is(err, errNoEndpoints) {
-				log.ZWarn(context.Background(), "initializeConnMap err", err)
-			}
-		}()
+	for _, name := range s.watchNames {
+		if _, err := s.ensureServiceEntry(context.Background(), name); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			log.ZWarn(context.Background(), "preload service entry failed", err, "service", name)
+		}
 	}
 	return s, nil
 }
@@ -215,83 +617,49 @@ func (r *SvcDiscoveryRegistryImpl) GetUserIdHashGatewayHost(ctx context.Context,
 	return "", nil
 }
 
-// initializeConnMap warms up connections for watched services.
-func (r *SvcDiscoveryRegistryImpl) initializeConnMap(opts ...grpc.DialOption) error {
-	for _, name := range r.watchNames {
-		if _, err := r.GetConns(context.Background(), name, opts...); err != nil && !errors.Is(err, errNoEndpoints) {
-			return err
-		}
-	}
-	return nil
-}
-
 // GetConns returns all connections for a service.
 func (r *SvcDiscoveryRegistryImpl) GetConns(ctx context.Context, serviceName string, opts ...grpc.DialOption) ([]grpc.ClientConnInterface, error) {
-	ctx = contextOrBackground(ctx)
-	prefix := r.servicePrefix(serviceName)
+
+	entry, err := r.ensureServiceEntry(ctx, serviceName)
+	if err != nil {
+		return nil, err
+	}
 
 	waitDeadline := time.Time{}
 	if r.initialResolveWait > 0 {
 		waitDeadline = time.Now().Add(r.initialResolveWait)
 	}
 
+	dialOptions := append(r.getDialOptions(), opts...)
+
 	for {
-		reqCtx, cancel := withRequestTimeout(ctx)
-		resp, err := r.client.Get(reqCtx, prefix, clientv3.WithPrefix())
-		cancel()
-		if err != nil {
-			if waitDeadline.IsZero() || time.Now().After(waitDeadline) {
-				return nil, err
-			}
-			if waitErr := waitUntil(ctx, waitDeadline); waitErr != nil {
-				return nil, waitErr
-			}
-			continue
-		}
-
-		addresses := make([]string, 0, len(resp.Kvs))
-		for _, kv := range resp.Kvs {
-			if addr := r.extractAddress(string(kv.Key)); addr != "" {
-				addresses = append(addresses, addr)
-			}
-		}
-
+		addresses := entry.addressesList()
 		if len(addresses) == 0 {
 			if !waitDeadline.IsZero() && time.Now().Before(waitDeadline) {
-				if waitErr := waitUntil(ctx, waitDeadline); waitErr != nil {
-					return nil, waitErr
+				ch := entry.subscribe()
+				addresses = entry.addressesList()
+				if len(addresses) > 0 {
+					continue
+				}
+				if err := waitForEntryUpdate(ctx, ch, waitDeadline); err != nil {
+					if errors.Is(err, context.DeadlineExceeded) {
+						return nil, fmt.Errorf("%w: service=%s", errNoEndpoints, serviceName)
+					}
+					return nil, err
 				}
 				continue
 			}
-			r.clearServiceCache(serviceName)
 			return nil, fmt.Errorf("%w: service=%s", errNoEndpoints, serviceName)
 		}
 
 		sort.Strings(addresses)
 
-		dialOptions := append(r.getDialOptions(), opts...)
-		if err := r.checkOpts(dialOptions...); err != nil {
-			return nil, errs.WrapMsg(err, "checkOpts is failed")
-		}
-
 		conns, err := r.ensureConnections(ctx, serviceName, addresses, dialOptions)
 		if err != nil {
-			if waitDeadline.IsZero() || time.Now().After(waitDeadline) {
-				return nil, err
-			}
-			if waitErr := waitUntil(ctx, waitDeadline); waitErr != nil {
-				return nil, waitErr
-			}
-			continue
+			return nil, err
 		}
 
 		if len(conns) == 0 {
-			if !waitDeadline.IsZero() && time.Now().Before(waitDeadline) {
-				if waitErr := waitUntil(ctx, waitDeadline); waitErr != nil {
-					return nil, waitErr
-				}
-				continue
-			}
 			return nil, fmt.Errorf("%w: service=%s", errNoEndpoints, serviceName)
 		}
 
@@ -300,6 +668,323 @@ func (r *SvcDiscoveryRegistryImpl) GetConns(ctx context.Context, serviceName str
 			result[i] = conns[i]
 		}
 		return result, nil
+	}
+}
+
+func (r *SvcDiscoveryRegistryImpl) ensureServiceEntry(ctx context.Context, serviceName string) (*serviceEntry, error) {
+	r.mu.Lock()
+	entry, ok := r.serviceEntries[serviceName]
+	if !ok {
+		entry = newServiceEntry()
+		r.serviceEntries[serviceName] = entry
+	}
+	r.mu.Unlock()
+
+	entry.initOnce.Do(func() {
+		if err := r.loadInitialAddresses(serviceName, entry); err != nil {
+			log.ZWarn(context.Background(), "load initial endpoints failed", err, "service", serviceName)
+		}
+		entry.markReady()
+		entry.setCancel(r.startServiceWatcher(serviceName, entry))
+	})
+
+	if err := entry.waitReady(ctx); err != nil {
+		return entry, err
+	}
+	return entry, nil
+}
+
+func (r *SvcDiscoveryRegistryImpl) loadInitialAddresses(serviceName string, entry *serviceEntry) error {
+	ctx, cancel := withRequestTimeout(context.Background())
+	defer cancel()
+
+	prefix := r.servicePrefix(serviceName)
+	resp, err := r.client.Get(ctx, prefix, clientv3.WithPrefix())
+	if err != nil {
+		entry.setAddresses(nil)
+		r.syncConnCache(serviceName, nil)
+		return err
+	}
+
+	addresses := r.parseAddresses(resp.Kvs)
+	entry.setAddresses(addresses)
+	r.syncConnCache(serviceName, addresses)
+	return nil
+}
+
+func (r *SvcDiscoveryRegistryImpl) startServiceWatcher(serviceName string, entry *serviceEntry) context.CancelFunc {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		defer entry.notify()
+		prefix := r.servicePrefix(serviceName)
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			watchChan := r.client.Watch(ctx, prefix, clientv3.WithPrefix())
+			for watchResp := range watchChan {
+				if watchResp.Canceled {
+					if ctx.Err() != nil {
+						return
+					}
+					break
+				}
+				changed := false
+				for _, event := range watchResp.Events {
+					addr := r.extractAddress(string(event.Kv.Key))
+					if addr == "" {
+						continue
+					}
+					switch event.Type {
+					case mvccpb.PUT:
+						if entry.addAddress(addr) {
+							changed = true
+						}
+					case mvccpb.DELETE:
+						if entry.removeAddress(addr) {
+							changed = true
+						}
+					}
+				}
+				if changed {
+					entry.notify()
+					r.syncConnCache(serviceName, entry.addressesList())
+				}
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			time.Sleep(time.Second)
+		}
+	}()
+	return cancel
+}
+
+func (r *SvcDiscoveryRegistryImpl) ensureKeyEntry(ctx context.Context, key string) (*keyEntry, error) {
+	r.mu.Lock()
+	entry, ok := r.keyEntries[key]
+	if !ok {
+		entry = newKeyEntry()
+		r.keyEntries[key] = entry
+	}
+	r.mu.Unlock()
+
+	entry.initOnce.Do(func() {
+		if err := r.loadKeyValue(key, entry); err != nil {
+			log.ZWarn(context.Background(), "load key value failed", err, "key", key)
+		}
+		entry.markReady()
+		entry.setCancel(r.startKeyWatcher(key, entry))
+	})
+
+	if err := entry.waitReady(ctx); err != nil {
+		return entry, err
+	}
+	return entry, nil
+}
+
+func (r *SvcDiscoveryRegistryImpl) loadKeyValue(key string, entry *keyEntry) error {
+	ctx, cancel := withRequestTimeout(context.Background())
+	defer cancel()
+
+	resp, err := r.client.Get(ctx, key)
+	if err != nil {
+		entry.setValue(nil, false)
+		return err
+	}
+	if len(resp.Kvs) == 0 {
+		entry.setValue(nil, false)
+		return nil
+	}
+	entry.setValue(resp.Kvs[0].Value, true)
+	return nil
+}
+
+func (r *SvcDiscoveryRegistryImpl) startKeyWatcher(key string, entry *keyEntry) context.CancelFunc {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		defer entry.notify()
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			watchChan := r.client.Watch(ctx, key, clientv3.WithPrefix())
+			for watchResp := range watchChan {
+				if watchResp.Canceled {
+					if ctx.Err() != nil {
+						return
+					}
+					break
+				}
+				for _, event := range watchResp.Events {
+					switch event.Type {
+					case mvccpb.PUT:
+						entry.setValue(event.Kv.Value, true)
+					case mvccpb.DELETE:
+						entry.setValue(nil, false)
+					}
+				}
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			time.Sleep(time.Second)
+		}
+	}()
+	return cancel
+}
+
+func (r *SvcDiscoveryRegistryImpl) ensurePrefixEntry(ctx context.Context, prefix string) (*prefixEntry, error) {
+	r.mu.Lock()
+	entry, ok := r.prefixEntries[prefix]
+	if !ok {
+		entry = newPrefixEntry()
+		r.prefixEntries[prefix] = entry
+	}
+	r.mu.Unlock()
+
+	entry.initOnce.Do(func() {
+		if err := r.loadPrefixValues(prefix, entry); err != nil {
+			log.ZWarn(context.Background(), "load prefix values failed", err, "prefix", prefix)
+		}
+		entry.markReady()
+		entry.setCancel(r.startPrefixWatcher(prefix, entry))
+	})
+
+	if err := entry.waitReady(ctx); err != nil {
+		return entry, err
+	}
+	return entry, nil
+}
+
+func (r *SvcDiscoveryRegistryImpl) loadPrefixValues(prefix string, entry *prefixEntry) error {
+	ctx, cancel := withRequestTimeout(context.Background())
+	defer cancel()
+
+	resp, err := r.client.Get(ctx, prefix, clientv3.WithPrefix())
+	if err != nil {
+		entry.setValues(nil)
+		return err
+	}
+	values := make(map[string][]byte, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		values[string(kv.Key)] = cloneBytes(kv.Value)
+	}
+	entry.setValues(values)
+	return nil
+}
+
+func (r *SvcDiscoveryRegistryImpl) startPrefixWatcher(prefix string, entry *prefixEntry) context.CancelFunc {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			watchChan := r.client.Watch(ctx, prefix, clientv3.WithPrefix())
+			for watchResp := range watchChan {
+				if watchResp.Canceled {
+					if ctx.Err() != nil {
+						return
+					}
+					break
+				}
+				for _, event := range watchResp.Events {
+					key := string(event.Kv.Key)
+					switch event.Type {
+					case mvccpb.PUT:
+						entry.upsert(key, event.Kv.Value)
+						entry.broadcast(key, event.Kv.Value, discovery.WatchTypePut)
+					case mvccpb.DELETE:
+						entry.remove(key)
+						entry.broadcast(key, nil, discovery.WatchTypeDelete)
+					}
+				}
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			time.Sleep(time.Second)
+		}
+	}()
+	return cancel
+}
+
+func (r *SvcDiscoveryRegistryImpl) parseAddresses(kvs []*mvccpb.KeyValue) []string {
+	if len(kvs) == 0 {
+		return nil
+	}
+	temp := make(map[string]struct{}, len(kvs))
+	for _, kv := range kvs {
+		addr := r.extractAddress(string(kv.Key))
+		if addr == "" {
+			continue
+		}
+		temp[addr] = struct{}{}
+	}
+	if len(temp) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(temp))
+	for addr := range temp {
+		result = append(result, addr)
+	}
+	return result
+}
+
+func (r *SvcDiscoveryRegistryImpl) syncConnCache(serviceName string, validAddrs []string) {
+	valid := make(map[string]struct{}, len(validAddrs))
+	for _, addr := range validAddrs {
+		valid[addr] = struct{}{}
+	}
+
+	var toClose []*grpc.ClientConn
+
+	r.mu.Lock()
+	if pool, ok := r.connCache[serviceName]; ok {
+		for addr, conn := range pool {
+			if _, ok := valid[addr]; !ok {
+				toClose = append(toClose, conn)
+				delete(pool, addr)
+			}
+		}
+		if len(pool) == 0 {
+			delete(r.connCache, serviceName)
+			delete(r.rrIndex, serviceName)
+		}
+	}
+	r.mu.Unlock()
+
+	for _, conn := range toClose {
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}
+}
+
+func (r *SvcDiscoveryRegistryImpl) updateLocalKeyValue(key string, value []byte, exists bool) {
+	r.mu.RLock()
+	keyEntry := r.keyEntries[key]
+	prefixEntries := make([]*prefixEntry, 0)
+	for prefix, entry := range r.prefixEntries {
+		if strings.HasPrefix(key, prefix) {
+			prefixEntries = append(prefixEntries, entry)
+		}
+	}
+	r.mu.RUnlock()
+
+	if keyEntry != nil {
+		keyEntry.setValue(value, exists)
+	}
+
+	for _, entry := range prefixEntries {
+		if exists {
+			entry.upsert(key, value)
+			entry.broadcast(key, value, discovery.WatchTypePut)
+		} else {
+			entry.remove(key)
+			entry.broadcast(key, nil, discovery.WatchTypeDelete)
+		}
 	}
 }
 
@@ -435,12 +1120,37 @@ func (r *SvcDiscoveryRegistryImpl) Close() {
 	r.connCache = make(map[string]map[string]*grpc.ClientConn)
 	registrations := r.registrations
 	r.registrations = make(map[string]*registration)
-	watchCancels := r.watchCancels
-	r.watchCancels = nil
+	entries := make([]*serviceEntry, 0, len(r.serviceEntries))
+	for _, entry := range r.serviceEntries {
+		entries = append(entries, entry)
+	}
+	r.serviceEntries = make(map[string]*serviceEntry)
+	keyEntries := make([]*keyEntry, 0, len(r.keyEntries))
+	for _, entry := range r.keyEntries {
+		keyEntries = append(keyEntries, entry)
+	}
+	r.keyEntries = make(map[string]*keyEntry)
+	prefixEntries := make([]*prefixEntry, 0, len(r.prefixEntries))
+	for _, entry := range r.prefixEntries {
+		prefixEntries = append(prefixEntries, entry)
+	}
+	r.prefixEntries = make(map[string]*prefixEntry)
 	r.mu.Unlock()
 
-	for _, cancel := range watchCancels {
-		cancel()
+	for _, entry := range entries {
+		if entry != nil {
+			entry.stop()
+		}
+	}
+	for _, entry := range keyEntries {
+		if entry != nil {
+			entry.stop()
+		}
+	}
+	for _, entry := range prefixEntries {
+		if entry != nil {
+			entry.stop()
+		}
 	}
 
 	for _, pool := range connCache {
@@ -742,13 +1452,6 @@ func (r *SvcDiscoveryRegistryImpl) dialConn(ctx context.Context, addr string, op
 	return nil, err
 }
 
-func contextOrBackground(ctx context.Context) context.Context {
-	if ctx != nil {
-		return ctx
-	}
-	return context.Background()
-}
-
 func (r *SvcDiscoveryRegistryImpl) refreshRegistration(reg *registration) error {
 	if reg.manager == nil {
 		return errors.New("nil endpoint manager")
@@ -819,31 +1522,6 @@ func (r *SvcDiscoveryRegistryImpl) waitForRetryOrStop(stop <-chan struct{}, dela
 	}
 }
 
-func waitUntil(ctx context.Context, deadline time.Time) error {
-	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return nil
-		}
-		wait := remaining
-		if wait > resolveRetryInterval {
-			wait = resolveRetryInterval
-		}
-		timer := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-}
-
 func nextBackoff(current time.Duration) time.Duration {
 	if current <= 0 {
 		return keepAliveInitialBackoff
@@ -855,13 +1533,49 @@ func nextBackoff(current time.Duration) time.Duration {
 	return current
 }
 
+func waitForEntryUpdate(ctx context.Context, ch <-chan struct{}, deadline time.Time) error {
+	if deadline.IsZero() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ch:
+			return nil
+		}
+	}
+
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return context.DeadlineExceeded
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+			return context.DeadlineExceeded
+		case <-ch:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil
+		}
+	}
+}
+
+func cloneBytes(src []byte) []byte {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]byte, len(src))
+	copy(dst, src)
+	return dst
+}
+
 func withRequestTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if _, ok := ctx.Deadline(); ok {
-		return ctx, func() {}
-	}
 	ctx, cancel := context.WithTimeout(ctx, defaultRequestTimeout)
 	return ctx, cancel
 }
@@ -870,6 +1584,7 @@ func (r *SvcDiscoveryRegistryImpl) SetKey(ctx context.Context, key string, data 
 	if _, err := r.client.Put(ctx, key, string(data)); err != nil {
 		return errs.WrapMsg(err, "etcd put err")
 	}
+	r.updateLocalKeyValue(key, data, true)
 	return nil
 }
 
@@ -883,85 +1598,87 @@ func (r *SvcDiscoveryRegistryImpl) SetWithLease(ctx context.Context, key string,
 		return errs.Wrap(err)
 	}
 
+	r.updateLocalKeyValue(key, val, true)
 	go r.keepAliveLease(leaseResp.ID)
 	return nil
 }
 
 func (r *SvcDiscoveryRegistryImpl) GetKey(ctx context.Context, key string) ([]byte, error) {
-	resp, err := r.client.Get(ctx, key)
+	entry, err := r.ensureKeyEntry(ctx, key)
 	if err != nil {
-		return nil, errs.WrapMsg(err, "etcd get err")
+		return nil, err
 	}
-	if len(resp.Kvs) == 0 {
+	value, ok := entry.getValue()
+	if !ok {
 		return nil, nil
 	}
-	return resp.Kvs[0].Value, nil
+	return value, nil
 }
 
-func (r *SvcDiscoveryRegistryImpl) GetKeyWithPrefix(ctx context.Context, key string) ([][]byte, error) {
-	resp, err := r.client.Get(ctx, key, clientv3.WithPrefix())
+func (r *SvcDiscoveryRegistryImpl) GetKeyWithPrefix(ctx context.Context, prefix string) ([][]byte, error) {
+	entry, err := r.ensurePrefixEntry(ctx, prefix)
 	if err != nil {
-		return nil, errs.WrapMsg(err, "etcd get err")
+		return nil, err
 	}
-	if len(resp.Kvs) == 0 {
-		return nil, nil
-	}
-	result := make([][]byte, 0, len(resp.Kvs))
-	for _, kv := range resp.Kvs {
-		result = append(result, kv.Value)
-	}
-	return result, nil
+	return entry.valuesList(), nil
 }
 
 func (r *SvcDiscoveryRegistryImpl) DelData(ctx context.Context, key string) error {
 	if _, err := r.client.Delete(ctx, key); err != nil {
 		return errs.WrapMsg(err, "etcd delete err")
 	}
+	r.updateLocalKeyValue(key, nil, false)
 	return nil
 }
 
-func (r *SvcDiscoveryRegistryImpl) WatchKey(ctx context.Context, key string, fn discovery.WatchKeyHandler) error {
-	watchChan := r.client.Watch(ctx, key)
-	for watchResp := range watchChan {
-		for _, event := range watchResp.Events {
-			if event.IsModify() && string(event.Kv.Key) == key {
-				if err := fn(&discovery.WatchKey{Value: event.Kv.Value}); err != nil {
-					return err
-				}
+func (r *SvcDiscoveryRegistryImpl) WatchKey(ctx context.Context, name string, fn discovery.WatchKeyHandler) error {
+	prefix := r.servicePrefix(name)
+	entry, err := r.ensurePrefixEntry(ctx, prefix)
+	if err != nil {
+		return err
+	}
+
+	// deliver current snapshot first
+	for k, v := range entry.snapshot() {
+		if !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		data := &discovery.WatchKey{Key: []byte(k), Value: cloneBytes(v), Type: discovery.WatchTypePut}
+		if err := fn(data); err != nil {
+			return err
+		}
+	}
+
+	updates, cancel := entry.subscribeWatcher()
+	defer cancel()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case data, ok := <-updates:
+			if !ok {
+				return nil
+			}
+			if data == nil {
+				continue
+			}
+			keyBytes := cloneBytes(data.Key)
+			keyStr := string(keyBytes)
+			if !strings.HasPrefix(keyStr, prefix) {
+				continue
+			}
+			var valueCopy []byte
+			if data.Value != nil {
+				valueCopy = cloneBytes(data.Value)
+			}
+			if err := fn(&discovery.WatchKey{Key: keyBytes, Value: valueCopy, Type: data.Type}); err != nil {
+				return err
 			}
 		}
 	}
-	return nil
-}
-
-func (r *SvcDiscoveryRegistryImpl) watchServiceChanges() {
-	if len(r.watchNames) == 0 {
-		return
-	}
-	for _, name := range r.watchNames {
-		service := name
-		ctx, cancel := context.WithCancel(context.Background())
-
-		r.mu.Lock()
-		r.watchCancels = append(r.watchCancels, cancel)
-		r.mu.Unlock()
-
-		go func() {
-			watchChan := r.client.Watch(ctx, r.servicePrefix(service), clientv3.WithPrefix())
-			for range watchChan {
-				r.clearServiceCache(service)
-			}
-		}()
-	}
-}
-
-func (r *SvcDiscoveryRegistryImpl) checkOpts(opts ...grpc.DialOption) error {
-	return nil
 }
 
 func withConfigValue(ctx context.Context, key contextKey, value interface{}) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	return context.WithValue(ctx, key, value)
 }
