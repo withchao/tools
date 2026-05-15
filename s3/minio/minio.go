@@ -329,7 +329,6 @@ func (m *Minio) StatObject(ctx context.Context, name string) (*s3.ObjectInfo, er
 }
 
 func (m *Minio) copyObject(ctx context.Context, dst minio.CopyDestOptions, src minio.CopySrcOptions) (minio.UploadInfo, error) {
-	_ = m.core.Client.CopyObject
 	if err := copySrcOptionsValidate(src); err != nil {
 		return minio.UploadInfo{}, err
 	}
