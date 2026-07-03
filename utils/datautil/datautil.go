@@ -467,7 +467,6 @@ func BothExist[E comparable](es ...[]E) []E {
 	})
 }
 
-
 // Complete whether a and b are equal after deduplication (ignore order)
 func Complete[E comparable](a []E, b []E) bool {
 	return len(Single(a, b)) == 0
@@ -729,4 +728,23 @@ func GetElemByIndex(array []int, index int) (int, error) {
 	}
 
 	return array[index], nil
+}
+
+func Foreach[T any](array []T, fn func(T)) {
+	for _, item := range array {
+		fn(item)
+	}
+}
+
+func ForEachMap[K comparable, V any](m map[K]V, fn func(key K, value V)) {
+	for k, v := range m {
+		fn(k, v)
+	}
+}
+
+func IfNil[T any](ptr *T, fallback T) T {
+	if ptr == nil {
+		return fallback
+	}
+	return *ptr
 }
