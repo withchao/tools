@@ -4,6 +4,8 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v4"
+	"github.com/google/uuid"
+
 	"github.com/openimsdk/tools/errs"
 )
 
@@ -26,6 +28,7 @@ func BuildClaims(uid string, platformID int, ttl int64) Claims {
 			ExpiresAt: jwt.NewNumericDate(now.Add(time.Duration(ttl*HoursOneDay) * time.Hour)), // Expiration time
 			IssuedAt:  jwt.NewNumericDate(before),                                              // Issuing time
 			//NotBefore: jwt.NewNumericDate(before),                                              // Begin Effective time
+			ID: uuid.New().String(),
 		},
 	}
 }
