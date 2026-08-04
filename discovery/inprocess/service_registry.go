@@ -90,3 +90,7 @@ func SetBroadcastAddress(secret string, fn BroadcastAddressProvider) {
 func SetLocalTarget(addr string) {
 	global.setLocalTarget(addr)
 }
+
+func SetContextAdminFunc(fn func(ctx context.Context) bool) {
+	contextAdminFunc.Store(&fn)
+}

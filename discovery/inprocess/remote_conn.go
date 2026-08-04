@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -21,6 +22,8 @@ import (
 )
 
 const BroadcastPath = "/internal/api_invoke_rpc"
+
+var contextAdminFunc atomic.Pointer[func(ctx context.Context) bool]
 
 // BroadcastAddressProvider returns the http api addresses of the other
 // in-process-mode instances, excluding this one; the local instance is always
@@ -66,16 +69,18 @@ type remoteClientConn struct {
 	codec       messageCodec
 }
 
-// invokeRequest must match the request type of internalApi.RpcInvoke.
-type invokeRequest struct {
-	Service string `json:"service"`
-	Method  string `json:"method"`
-	Secret  string `json:"secret"`
-	Request []byte `json:"request"`
+// InvokeRequest must match the request type of internalApi.RpcInvoke.
+type InvokeRequest struct {
+	Service  string `json:"service"`
+	Method   string `json:"method"`
+	Secret   string `json:"secret"`
+	OpUserID string `json:"op_user_id"`
+	Admin    bool   `json:"admin"`
+	Request  []byte `json:"request"`
 }
 
-// invokeResponse is the apiresp.ApiResponse envelope with []byte data.
-type invokeResponse struct {
+// InvokeResponse is the apiresp.ApiResponse envelope with []byte data.
+type InvokeResponse struct {
 	ErrCode int    `json:"errCode"`
 	ErrMsg  string `json:"errMsg"`
 	ErrDlt  string `json:"errDlt"`
@@ -91,11 +96,17 @@ func (c *remoteClientConn) Invoke(ctx context.Context, method string, args any, 
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(invokeRequest{
-		Service: c.serviceName,
-		Method:  method,
-		Secret:  c.secret,
-		Request: reqData,
+	var admin bool
+	if fn := contextAdminFunc.Load(); fn != nil && *fn != nil {
+		admin = (*fn)(ctx)
+	}
+	body, err := json.Marshal(InvokeRequest{
+		Service:  c.serviceName,
+		Method:   method,
+		Secret:   c.secret,
+		OpUserID: mcontext.GetOpUserID(ctx),
+		Admin:    admin,
+		Request:  reqData,
 	})
 	if err != nil {
 		return errs.WrapMsg(err, "marshal remote invoke request")
@@ -122,7 +133,7 @@ func (c *remoteClientConn) Invoke(ctx context.Context, method string, args any, 
 	if httpResp.StatusCode != http.StatusOK {
 		return errs.New("remote invoke http status not ok", "url", c.endpoint, "method", method, "status", httpResp.Status, "body", string(respBody)).Wrap()
 	}
-	var resp invokeResponse
+	var resp InvokeResponse
 	if err := json.Unmarshal(respBody, &resp); err != nil {
 		return errs.WrapMsg(err, "unmarshal remote invoke response", "url", c.endpoint, "method", method, "body", string(respBody))
 	}
